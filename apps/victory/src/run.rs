@@ -132,6 +132,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    patch(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -149,6 +150,68 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+}
+
+/// Debugging aid (local): `VICTORY_PATCH=<rva>:<old>:<new>,...` (hex; bytes as
+/// hex digit pairs) replaces title bytes before the title starts, only where
+/// the image holds exactly `<old>` there, so another build is never patched.
+/// Memory only: the game's files are not touched.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn patch(base: usize, size: usize) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualProtect(address: *mut u8, size: usize, protect: u32, old: *mut u32) -> i32;
+        fn FlushInstructionCache(process: isize, address: *const u8, size: usize) -> i32;
+    }
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    let Ok(list) = std::env::var("VICTORY_PATCH") else {
+        return;
+    };
+    let bytes = |s: &str| -> Option<Vec<u8>> {
+        let s = s.trim();
+        if s.is_empty() || s.len() % 2 != 0 {
+            return None;
+        }
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    };
+    for entry in list.split(',').filter(|e| !e.trim().is_empty()) {
+        let mut parts = entry.split(':');
+        let (Some(rva), Some(old), Some(new), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+            eprintln!("VIctory: VICTORY_PATCH entry {entry:?} not understood (rva:old:new)");
+            continue;
+        };
+        let (Ok(rva), Some(old), Some(new)) = (
+            usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16),
+            bytes(old),
+            bytes(new),
+        ) else {
+            eprintln!("VIctory: VICTORY_PATCH entry {entry:?} not understood (rva:old:new)");
+            continue;
+        };
+        if old.len() != new.len() || rva.checked_add(old.len()).is_none_or(|end| end > size) {
+            eprintln!("VIctory: VICTORY_PATCH entry {entry:?}: lengths differ or past the image");
+            continue;
+        }
+        let at = (base + rva) as *mut u8;
+        // SAFETY: `old.len()` bytes inside the mapped image, checked above.
+        let current = unsafe { std::slice::from_raw_parts(at, old.len()) };
+        if current != old.as_slice() {
+            eprintln!("VIctory: VICTORY_PATCH title+{rva:#x}: bytes differ from the expected ones; not patched");
+            continue;
+        }
+        let mut was = 0;
+        // SAFETY: the same checked range; protection restored right after.
+        unsafe {
+            if VirtualProtect(at, new.len(), PAGE_EXECUTE_READWRITE, &mut was) == 0 {
+                eprintln!("VIctory: VICTORY_PATCH title+{rva:#x}: VirtualProtect failed");
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(new.as_ptr(), at, new.len());
+            VirtualProtect(at, new.len(), was, &mut was);
+            FlushInstructionCache(-1, at, new.len());
+        }
+        eprintln!("VIctory: VICTORY_PATCH title+{rva:#x}: {} bytes patched", new.len());
+    }
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
