@@ -200,9 +200,42 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(&block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        let whole = unsafe {
+            VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+        } != 0;
+        if !whole {
+            // The block now spans views (the title maps at 4 KiB): one call
+            // cannot cross them, so each view's part is opened on its own.
+            open_views(block * BLOCK, (block + 1) * BLOCK);
+        }
     }
     !blocks.is_empty()
+}
+
+/// Gives write access back to `[from, to)` view by view: the read-only
+/// mapped regions in it, each with a call of its own.
+fn open_views(from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
+        VirtualQuery,
+    };
+    let mut at = from;
+    while at < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            return;
+        }
+        let end = (info.BaseAddress as usize + info.RegionSize).min(to).max(at + 1);
+        if info.Type == MEM_MAPPED && info.Protect == PAGE_READONLY {
+            let mut old = 0;
+            // SAFETY: title view memory inside one region; only its
+            // protection changes.
+            unsafe { VirtualProtect(at as *const _, end - at, PAGE_READWRITE, &mut old) };
+        }
+        at = end;
+    }
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -275,12 +308,26 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // Read-only view memory no guard claims: a guard that lost track
+        // (blocks are 64 KiB, the title's views 4 KiB-aligned). The console
+        // never write-protects title views, so the block is opened and noted
+        // written (not clean), and the copies taken from it are made again.
+        if readonly_view(at) {
             #[cfg(feature = "diagnostics")]
             unguarded_write(at);
-            EXCEPTION_CONTINUE_SEARCH
+            let block = at / BLOCK;
+            let mut g = guards();
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+            open_views(block * BLOCK, (block + 1) * BLOCK);
+            drop(g);
+            if writable(at) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
         }
+        EXCEPTION_CONTINUE_SEARCH
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
@@ -305,6 +352,18 @@ fn unguarded_write(at: usize) {
             info.State, info.Protect, info.Type, info.BaseAddress as usize, info.RegionSize
         );
     }
+}
+
+/// Whether `at` is committed, read-only mapped (view) memory.
+fn readonly_view(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Type == MEM_MAPPED && info.Protect == PAGE_READONLY
 }
 
 /// Whether `at` is committed read-write memory now.
