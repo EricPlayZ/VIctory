@@ -390,6 +390,245 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     Ok(out)
 }
 
+/// Hand-written console programs (assembled from the comments next to
+/// their words) through every stage of the translation; the DXIL must
+/// validate when the Windows SDK's `dxil.dll` is present.
+#[cfg(test)]
+mod programs {
+    use crate::dxbc::Container;
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
+    use crate::{ShaderError, io, ir, resource, structure};
+
+    pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A table holding one descriptor of `kind`, its address in user SGPR
+    /// `sgpr`.
+    pub(super) fn table(sgpr: u8, slot: u8, kind: ResourceType) -> (RootParam, UsedResource) {
+        (
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: sgpr,
+                slot,
+            },
+            UsedResource {
+                kind,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: if kind == ResourceType::Sampler { 4 } else { 8 },
+                user_data: sgpr,
+                slot,
+            },
+        )
+    }
+
+    /// A wave64 compute or pixel program of `words` with the root
+    /// parameters `tables` (thread id x in v0 for compute).
+    pub(super) fn translate(
+        stage: HwStage,
+        words: &[u32],
+        tables: &[(RootParam, UsedResource)],
+    ) -> Result<super::HostShader, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let user = tables
+            .iter()
+            .map(|t| u32::from(t.0.user_data) + t.0.sgprs)
+            .max()
+            .unwrap_or(0);
+        let io = match stage {
+            HwStage::Cs => StageIo::Cs(ComputeIo {
+                rsrc2: user << 1,
+                threads: [64, 1, 1],
+            }),
+            _ => StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+        };
+        let native = NativeProgram {
+            stage,
+            wave64: true,
+            vgprs: 32,
+            layout: tables.iter().map(|t| t.0).collect(),
+            used: tables.iter().map(|t| t.1).collect(),
+            io,
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let raised = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let mut h = super::emit(&c, &native, &p, &st, &raised, &res)?;
+        // For reading the result (`dxc -dumpbin`): each program's DXIL in
+        // that folder.
+        if let Ok(dir) = std::env::var("VICTORY_TEST_DXIL") {
+            let id = words.iter().fold(0u32, |a, w| a.rotate_left(5) ^ w);
+            std::fs::write(format!("{dir}/{id:08x}.dxil"), &h.dxil).ok();
+        }
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut h.dxil).expect("DXIL validates");
+        }
+        Ok(h)
+    }
+
+    #[test]
+    fn swap_and_xnor() {
+        let uav = table(0, 0, ResourceType::Uav);
+        translate(
+            HwStage::Cs,
+            &[
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF408_0100,
+                0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0x0
+                0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+                0x7E04_0287, // v_mov_b32 v2, 7
+                0x7E06_0300, // v_mov_b32 v3, v0
+                0x7E04_CB03, // v_swap_b32 v2, v3
+                0x3C08_0702, // v_xnor_b32 v4, v2, v3
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xE070_1000,
+                0x8001_0401, // buffer_store_dword v4, v1, s[4:7], 0 offen
+                S_ENDPGM,
+            ],
+            &[uav],
+        )
+        .unwrap();
+    }
+
+    /// Texture, sampler and UAV tables in s0, s1, s2.
+    fn sampling_tables() -> [(RootParam, UsedResource); 3] {
+        [
+            table(0, 0, ResourceType::Srv),
+            table(1, 1, ResourceType::Sampler),
+            table(2, 2, ResourceType::Uav),
+        ]
+    }
+
+    #[test]
+    fn biased_a16_gradient_clamped_and_offset_samples() {
+        translate(
+            HwStage::Ps,
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xBE86_0301, // s_mov_b32 s6, s1
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xBE88_0302, // s_mov_b32 s8, s2
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF40C_0302,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+                0xF408_0503,
+                0xFA00_0000, // s_load_dwordx4 s[20:23], s[6:7], 0x0
+                0xF408_0604,
+                0xFA00_0000, // s_load_dwordx4 s[24:27], s[8:9], 0x0
+                0x7E02_02FF,
+                0x3E80_0000, // v_mov_b32 v1, 0x3e800000
+                0x1002_02FF,
+                0x3C80_0000, // v_mul_f32 v1, 0x3c800000, v1
+                0x7E04_02F0, // v_mov_b32 v2, 0.5
+                0x7E0A_1501, // v_cvt_f16_f32 v5, v1
+                0x7E0C_1502, // v_cvt_f16_f32 v6, v2
+                0xD711_0004,
+                0x0002_0D05, // v_pack_b32_f16 v4, v5, v6
+                0x7E06_02FF,
+                0x0000_3800, // v_mov_b32 v3, 0x3800
+                0x7E18_02FF,
+                0x3C80_0000, // v_mov_b32 v12, 0x3c800000
+                0x7E1A_0280, // v_mov_b32 v13, 0
+                0x7E1C_0280, // v_mov_b32 v14, 0
+                0x7E1E_02FF,
+                0x3C80_0000, // v_mov_b32 v15, 0x3c800000
+                0x7E20_02F2, // v_mov_b32 v16, 1.0
+                0x7E2A_02FF,
+                0x0000_3F01, // v_mov_b32 v21, 0x3f01
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF094_0F0A,
+                0x40A3_0803,
+                0x0000_0004, // image_sample_b v[8:11], [v3, v4], s[12:19], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D a16
+                0xF08C_0F0C,
+                0x00A3_110C,
+                0x010F_0E0D,
+                0x0000_1002, // image_sample_d_cl v[17:20], [v12, v13, v14, v15, v1, v2, v16], s[12:19], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D
+                0xF0C0_0F0A,
+                0x00A3_1615,
+                0x0000_0201, // image_sample_o v[22:25], [v21, v1, v2], s[12:19], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0x0610_2308, // v_add_f32 v8, v8, v17
+                0x0610_2D08, // v_add_f32 v8, v8, v22
+                0x7E34_0280, // v_mov_b32 v26, 0
+                0xE070_1000,
+                0x8006_081A, // buffer_store_dword v8, v26, s[24:27], 0 offen
+                0xBF81_0000, // s_endpgm
+            ],
+            &sampling_tables(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cube_gradients_with_a_level_clamp() {
+        translate(
+            HwStage::Cs,
+            &[
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xBE86_0301, // s_mov_b32 s6, s1
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xBE88_0302, // s_mov_b32 s8, s2
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF40C_0302,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+                0xF408_0503,
+                0xFA00_0000, // s_load_dwordx4 s[20:23], s[6:7], 0x0
+                0xF408_0604,
+                0xFA00_0000, // s_load_dwordx4 s[24:27], s[8:9], 0x0
+                0x7E02_0D00, // v_cvt_f32_u32 v1, v0
+                0x1002_02FF,
+                0x3C80_0000, // v_mul_f32 v1, 0x3c800000, v1
+                0x0602_02F2, // v_add_f32 v1, 1.0, v1
+                0x7E04_02FF,
+                0x3FC0_0000, // v_mov_b32 v2, 0x3fc00000
+                0x7E06_02F6, // v_mov_b32 v3, 4.0
+                0x7E18_02FF,
+                0x3C80_0000, // v_mov_b32 v12, 0x3c800000
+                0x7E1A_0280, // v_mov_b32 v13, 0
+                0x7E1C_0280, // v_mov_b32 v14, 0
+                0x7E1E_02FF,
+                0x3C80_0000, // v_mov_b32 v15, 0x3c800000
+                0x7E20_02F2, // v_mov_b32 v16, 1.0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF08C_071C,
+                0x00A3_110C,
+                0x010F_0E0D,
+                0x0010_0302, // image_sample_d_cl v[17:19], [v12, v13, v14, v15, v1, v2, v3, v16], s[12:19], s[20:23] dmask:0x7 dim:SQ_RSRC_IMG_CUBE
+                0x3434_0082, // v_lshlrev_b32 v26, 2, v0
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xE070_1000,
+                0x8006_121A, // buffer_store_dword v18, v26, s[24:27], 0 offen
+                0xBF81_0000, // s_endpgm
+            ],
+            &sampling_tables(),
+        )
+        .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::bitcode::Attr;

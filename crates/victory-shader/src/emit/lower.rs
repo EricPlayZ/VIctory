@@ -5239,9 +5239,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -5270,18 +5267,49 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
+        // What a sample or gather's name adds to its address: `_o` a texel
+        // offset, `_b` a bias, `_c` a reference value (in that order, a
+        // dword each), `_d` explicit gradients, `_cl` a level clamp after
+        // the coordinates.
+        let sampling = name.starts_with("image_sample") || name.starts_with("image_gather");
+        let has = |part: &str| sampling && name.split('_').skip(2).any(|s| s == part);
+        let offset_word = has("o");
+        let extra = usize::from(offset_word) + usize::from(has("b")) + usize::from(has("c"));
+        // Gradients per direction: the coordinates less an array slice or
+        // a cube face (cube gradients are of the face coordinates).
+        let per_dir = if has("d") {
+            coords - usize::from(matches!(dim, 3..=5))
+        } else {
+            0
+        };
+        // Logical address `k` (the extra dwords, the gradients, then the
+        // coordinates and level) as a VGPR and, with a16, the half: extra
+        // dwords stay whole (an a16 bias is an f16 in the low half), each
+        // gradient direction starts a VGPR, the coordinates and level are
+        // packed two per VGPR, low half first.
+        let place = |k: usize| -> (usize, Option<u32>) {
+            if k < extra || !*a16 {
+                return (k, None);
+            }
+            let g = k - extra;
+            let dir_dwords = per_dir.div_ceil(2);
+            if g < 2 * per_dir {
+                let (dir, j) = (g / per_dir, g % per_dir);
+                return (extra + dir * dir_dwords + j / 2, Some(j as u32 % 2));
+            }
+            let c = g - 2 * per_dir;
+            (extra + 2 * dir_dwords + c / 2, Some(c as u32 % 2))
+        };
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let r = *regs
-                .get(if *a16 { k / 2 } else { k })
-                .ok_or("an image address")?;
+            let (at, half) = place(k);
+            let r = *regs.get(at).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !*a16 {
+            let Some(half) = half else {
                 return Ok(x);
-            }
+            };
             let c = l.cur;
-            let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
+            let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
@@ -5424,7 +5452,11 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
-        let (op, sample) = match name {
+        // The name less a texel offset and a level clamp.
+        let clamped = has("cl");
+        let base = name.strip_suffix("_o").unwrap_or(name);
+        let base = base.strip_suffix("_cl").unwrap_or(base);
+        let (op, sample) = match base {
             "image_sample" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
@@ -5433,11 +5465,15 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
         };
+        // DXIL clamps the level of implicit-level and gradient samples.
+        if clamped && !matches!(op, 60 | 61 | 63 | 64) || offset_word && op == 81 {
+            return Err(name);
+        }
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
@@ -5491,15 +5527,13 @@ impl<'a> Lower<'a> {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
             let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
-            // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
-            // signed (programmable offsets: gathers only).
-            let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13, z
+            // in 16-21, signed (programmable offsets: gathers only).
+            let first = extra;
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            let grads = 2 * per_dir;
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -5514,9 +5548,10 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            let face = cs[2];
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -5566,20 +5601,47 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
+            if offset_word && op != 73 {
+                // Samples take immediate offsets, in [-8, 7].
+                if kind == 5 {
+                    return Err("a cube sample with a texel offset");
+                }
+                let w = addr_val(self, 0)?;
+                let w = self
+                    .s
+                    .m
+                    .int_value(w)
+                    .ok_or("a sample with a computed texel offset")?;
+                for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                    let x = ((w as u32 >> (8 * k)) as i32) << 26 >> 26;
+                    if !(-8..=7).contains(&x) {
+                        return Err("a texel offset outside [-8, 7]");
+                    }
+                    *o = self.s.m.i32(x as u32);
+                }
+            }
+            // The level clamp after the coordinates (`_cl`).
+            let clamp = if clamped {
+                let x = addr_val(self, first + grads + coords)?;
+                to_float(self, x)
+            } else {
+                fu
+            };
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
                 60 => {
                     args.extend(&os);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    // After the offset; with a16 an f16 in the low half.
+                    let bias = addr_val(self, usize::from(offset_word))?;
+                    let bias = to_float(self, bias);
                     args.extend(&os);
-                    args.extend([bias, fu]);
+                    args.extend([bias, clamp]);
                     self.s.op(
                         c,
                         "sampleBias.f32",
@@ -5591,15 +5653,22 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    for k in 0..per_dir {
                         let x = addr_val(self, first + k)?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, first + per_dir + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if kind == 5 {
+                        // Face-coordinate gradients as the direction's.
+                        let dx = self.cube_gradient(g[0], g[1], face);
+                        let dy = self.cube_gradient(g[3], g[4], face);
+                        g[..3].copy_from_slice(&dx);
+                        g[3..].copy_from_slice(&dy);
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -5615,7 +5684,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(reference);
                     let name = if op == 64 {
-                        args.push(fu);
+                        args.push(clamp);
                         "sampleCmp.f32"
                     } else {
                         "sampleCmpLevelZero.f32"
@@ -5624,8 +5693,8 @@ impl<'a> Lower<'a> {
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
-                    let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
+                    let lod = if base == "image_sample_l" {
+                        let x = addr_val(self, first + coords)?;
                         to_float(self, x)
                     } else {
                         self.s.m.f32(0)
@@ -5642,7 +5711,7 @@ impl<'a> Lower<'a> {
                     )
                 }
                 _ => {
-                    if name == "image_gather4" {
+                    if base == "image_gather4" {
                         return Err("a gather with implicit level");
                     }
                     if dmask.count_ones() != 1 {
@@ -5757,13 +5826,42 @@ impl<'a> Lower<'a> {
             self.s.m.bin(c, Bin::Sub, z, v),
         );
         let (one, mone) = (k(self, 1.0), k(self, -1.0));
-        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         // Per face +x, -x, +y, -y, +z, -z.
         let table = [
             [one, mone, u, u, u, nu],
             [nv, nv, one, mone, nv, nv],
             [nu, u, v, nv, one, mone],
         ];
+        self.cube_select(face, table)
+    }
+
+    /// The change of [`Self::cube_direction`] for a change of the face
+    /// coordinates by (ds, dt) on one face (the direction is linear in
+    /// them there, its major component fixed at 1 or -1, so the host
+    /// derives the same level of detail).
+    fn cube_gradient(&mut self, ds: V, dt: V, face: V) -> [V; 3] {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let du = self.s.m.bin(c, Bin::Mul, ds, two);
+        let dv = self.s.m.bin(c, Bin::Mul, dt, two);
+        let z = self.s.m.f32(0x8000_0000);
+        let (nu, nv) = (
+            self.s.m.bin(c, Bin::Sub, z, du),
+            self.s.m.bin(c, Bin::Sub, z, dv),
+        );
+        let zero = self.s.m.f32(0);
+        let table = [
+            [zero, zero, du, du, du, nu],
+            [nv, nv, zero, zero, nv, nv],
+            [nu, du, dv, nv, zero, zero],
+        ];
+        self.cube_select(face, table)
+    }
+
+    /// Per component, the entry of the face (a float id 0 to 5).
+    fn cube_select(&mut self, face: V, table: [[V; 6]; 3]) -> [V; 3] {
+        let c = self.cur;
+        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         table.map(|row| {
             let mut r = row[0];
             for (n, &x) in row.iter().enumerate().skip(1) {
