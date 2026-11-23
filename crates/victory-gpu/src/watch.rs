@@ -216,13 +216,31 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let mut g = guards();
+    let end = at + len;
     let blocks: Vec<usize> = g
         .protected
-        .range(at / BLOCK..(at + len).div_ceil(BLOCK))
+        .range(at / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
     for block in blocks {
+        // A remap covering only part of a guarded block (pages are 4 KiB,
+        // blocks 64 KiB) leaves the rest of the block read-only under its old
+        // mapping: give that part write access back before forgetting the
+        // block, or the title's next write there faults with no guard to
+        // take it.
+        let (from, to) = (block * BLOCK, (block + 1) * BLOCK);
+        let mut old = 0;
+        if from < at {
+            // SAFETY: title view memory we made read-only; only its
+            // protection changes (an unmapped part just fails).
+            unsafe { VirtualProtect(from as *const _, at - from, PAGE_READWRITE, &mut old) };
+        }
+        if end < to {
+            // SAFETY: as above.
+            unsafe { VirtualProtect(end as *const _, to - end, PAGE_READWRITE, &mut old) };
+        }
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
@@ -259,6 +277,8 @@ fn install() {
         if writable(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
+            #[cfg(feature = "diagnostics")]
+            unguarded_write(at);
             EXCEPTION_CONTINUE_SEARCH
         }
     }
@@ -267,6 +287,24 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Diagnostics: a write fault the guards did not take, at mapped (view)
+/// memory that is read-only: logged with its protection, as a guard lost
+/// track of would show.
+#[cfg(feature = "diagnostics")]
+fn unguarded_write(at: usize) {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n != 0 {
+        eprintln!(
+            "VIctory: write fault not taken by the guards at {at:#x}: state {:#x} protect {:#x} type {:#x}, region {:#x}+{:#x}",
+            info.State, info.Protect, info.Type, info.BaseAddress as usize, info.RegionSize
+        );
+    }
 }
 
 /// Whether `at` is committed read-write memory now.
