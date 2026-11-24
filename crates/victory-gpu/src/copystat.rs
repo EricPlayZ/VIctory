@@ -161,6 +161,39 @@ pub(crate) fn watch_failed_kind(from: usize, to: usize) {
             break;
         }
     }
+    // Page by page, for the first few: watched or not, and whose.
+    static WALKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if base != b.AllocationBase as usize && WALKED.fetch_add(1, Relaxed) < 6 {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        let mut text = String::new();
+        let mut last = (usize::MAX, false);
+        let (first, end) = (from / (64 << 10), (to - 1) / (64 << 10) + 1);
+        for page in first..end.min(first + 4096) {
+            let at = page * (64 << 10);
+            let mut found = [0usize; 16];
+            let (mut count, mut g) = (16usize, 0u32);
+            // SAFETY: an answer buffer of `count` entries; no reset.
+            let watched = unsafe {
+                GetWriteWatch(0, at as *const _, 64 << 10, found.as_mut_ptr().cast(), &mut count, &mut g) == 0
+            };
+            let r = query(at);
+            let key = (r.AllocationBase as usize, watched);
+            if key != last {
+                text.push_str(&format!(
+                    " | +{:#x}: base {:#x} {} type {:#x} state {:#x} prot {:#x}/{:#x}",
+                    at - from.min(at),
+                    r.AllocationBase as usize,
+                    if watched { "W" } else { "-" },
+                    r.Type,
+                    r.State,
+                    r.AllocationProtect,
+                    r.Protect
+                ));
+                last = key;
+            }
+        }
+        tracing::info!("local diag: unwatched range {from:#x}..{to:#x}:{text}");
+    }
     let key = (a.Type, b.Type, base == b.AllocationBase as usize, base, size);
     let mut m = FAILED_KINDS.lock().unwrap_or_else(|e| e.into_inner());
     let e = m.get_or_insert_with(Default::default).entry(key).or_default();
