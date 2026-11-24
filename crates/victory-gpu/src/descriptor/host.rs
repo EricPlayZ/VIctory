@@ -569,6 +569,8 @@ fn buffer_srv(
     if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
         return None;
     }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
@@ -599,6 +601,15 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&range.shadow.buffer, Some(&desc), at)
     };
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::SrvMaterializations, 1);
+        add(
+            C::SrvMaterializationUs,
+            started.elapsed().as_micros() as u64,
+        );
+    }
     Some(range)
 }
 

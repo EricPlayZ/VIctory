@@ -405,6 +405,117 @@ fn directly_indexed_srv_sees_producer_in_same_submission() {
 
 #[cfg(feature = "diagnostics")]
 #[test]
+fn directly_indexed_srv_unwatched_range_preserves_watched_refreshes() {
+    let Some((host, dxc)) = test_host() else {
+        return;
+    };
+    use crate::copystat::{C, read as counter};
+
+    const WATCHED: usize = 16 << 20;
+    const PAGE: usize = crate::watch::PAGE;
+    const CLEAN_RUNS: usize = 4;
+    const LEGACY_SOURCE: &str = r#"
+ByteAddressBuffer data : register(t0);
+RWByteAddressBuffer output_data : register(u0);
+[RootSignature("SRV(t0), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    output_data.Store(0, data.Load(0));
+}
+"#;
+
+    struct TitleResource(This);
+    impl Drop for TitleResource {
+        fn drop(&mut self) {
+            slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+        }
+    }
+
+    let (tracked, ordinary) = crate::watch::tests::adjacent(WATCHED, PAGE);
+    let base = tracked.0 as u64;
+    let resource = TitleResource(crate::resource::test_buffer_at(
+        base,
+        (WATCHED + PAGE) as u64,
+    ));
+    // SAFETY: the test owns the two committed title allocations. Touch all watched
+    // pages before refreshing so demand-zero faults do not skew the clean phase.
+    unsafe {
+        tracked.0.cast::<u8>().write_bytes(0, WATCHED);
+        tracked.0.cast::<u32>().write(13);
+        ordinary.0.cast::<u32>().write(27);
+    }
+
+    let shadow = crate::shadow::find(base, WATCHED as u64).unwrap();
+    let conventional = host.new_list().unwrap();
+    shadow.refresh(&conventional, base, WATCHED as u64);
+    let legacy = compile(host, &dxc, LEGACY_SOURCE);
+    crate::draw::State::default().bind(&conventional, &legacy, true);
+    let (output, conventional_result) = host.shared_buffer(4).unwrap();
+    // SAFETY: the resources and pipeline stay alive until this list completes.
+    unsafe {
+        conventional
+            .list
+            .SetComputeRootShaderResourceView(0, shadow.gpu(base));
+        conventional
+            .list
+            .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+        conventional.list.Dispatch(1, 1, 1);
+    }
+    conventional.close();
+    host.execute(&[&conventional]);
+    assert_eq!(read(conventional_result), 13);
+
+    let before = counter(C::ConventionalBytes);
+    host.execute(&[&conventional]);
+    assert_eq!(counter(C::ConventionalBytes) - before, 0);
+
+    let direct_pipeline = pipeline(host, &dxc);
+    let heap = TestHeap::new(64);
+    let mut view = [0; 10];
+    view[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+    view[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+    view[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view[4] = (WATCHED / 4) as u32;
+    view[6] = 1;
+    view[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+    create_srv(std::ptr::null(), resource.0, &view, heap.handle(17));
+    let (output, direct_result) = host.shared_buffer(4).unwrap();
+    let direct = host.new_list().unwrap();
+    record(&direct, heap.0, &direct_pipeline, 17, &output);
+    direct.close();
+    let before = counter(C::DirectBytes);
+    host.execute(&[&direct]);
+    let direct_bytes = counter(C::DirectBytes) - before;
+    assert_eq!(read(direct_result), 27);
+    assert_eq!(direct_bytes, 4);
+
+    let before = counter(C::ConventionalBytes);
+    let started = std::time::Instant::now();
+    for _ in 0..CLEAN_RUNS {
+        host.execute(&[&conventional]);
+    }
+    let clean_bytes = counter(C::ConventionalBytes) - before;
+    let clean_us = started.elapsed().as_micros();
+    // SAFETY: this dword is in the live write-watched reservation.
+    unsafe { tracked.0.cast::<u32>().write(500) };
+    let before = counter(C::ConventionalBytes);
+    host.execute(&[&conventional]);
+    let dirty_bytes = counter(C::ConventionalBytes) - before;
+    assert_eq!(read(conventional_result), 500);
+    eprintln!(
+        "mixed-reservation SRV: direct_bytes={direct_bytes} clean_submits={CLEAN_RUNS} \
+         clean_conventional_requested={} clean_conventional_bytes={clean_bytes} wall_us={clean_us} \
+         dirty_conventional_bytes={dirty_bytes} gpu_direct={} gpu_conventional={}",
+        WATCHED * CLEAN_RUNS,
+        read(direct_result),
+        read(conventional_result),
+    );
+    assert_eq!(clean_bytes, 0);
+    assert_eq!(dirty_bytes, PAGE as u64);
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
 fn directly_indexed_srv_sparse_heap_benchmark() {
     if std::env::var_os("VICTORY_COH_BENCH").is_none() {
         return;
@@ -497,4 +608,257 @@ fn directly_indexed_srv_sparse_heap_benchmark() {
             "clean watched pages require no transfer"
         );
     }
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn directly_indexed_srv_mixed_heap_benchmark() {
+    if std::env::var_os("VICTORY_COH_MIXED_BENCH").is_none() {
+        return;
+    }
+    let Some((host, dxc)) = test_host() else {
+        return;
+    };
+    use crate::copystat::{C, read as counter};
+
+    const PAGE: u64 = crate::watch::PAGE as u64;
+    const BUFFERS: usize = 192;
+    const CONVENTIONAL: usize = 144;
+    const SLOTS_PER_BUFFER: usize = 128;
+    const LISTS: usize = 4;
+    const RUNS: usize = 12;
+    const DISPATCHES_PER_LIST: u32 = 40;
+    const RANGE_LEN: u32 = 512;
+    const HEAP_CAPACITY: u32 = 262_144;
+    const SOURCE: &str = r#"
+cbuffer Input : register(b0) { uint index; uint result_index; }
+ByteAddressBuffer conventional_data : register(t0);
+RWByteAddressBuffer output_data : register(u0);
+[RootSignature("RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0)), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    ByteAddressBuffer data = ResourceDescriptorHeap[index];
+    output_data.Store2(8 * result_index, uint2(data.Load(0), conventional_data.Load(0)));
+}
+"#;
+
+    let mode = std::env::var("VICTORY_COH_MIXED_MEMORY").unwrap_or_else(|_| "mixed".into());
+    let watched = |i| match mode.as_str() {
+        "mixed" => i % 2 == 0,
+        "watched" => true,
+        "unwatched" => false,
+        _ => panic!("unknown VICTORY_COH_MIXED_MEMORY: {mode}"),
+    };
+    let slot = |buffer, within| ((buffer * SLOTS_PER_BUFFER + within) * 8) as u32;
+    let pipeline = compile(host, &dxc, SOURCE);
+    let heap = TestHeap::new(HEAP_CAPACITY);
+    let native = super::heap(heap.0).host().unwrap();
+    let titles: Vec<_> = (0..BUFFERS)
+        .map(|i| {
+            if watched(i) {
+                TitleBuffer::watched(2 * PAGE)
+            } else {
+                TitleBuffer::new(2 * PAGE)
+            }
+        })
+        .collect();
+    let initial_bytes = crate::host::test_submission_copy_bytes();
+    let initial_allocations = counter(C::ShadowAllocations);
+    let initial_allocation_bytes = counter(C::ShadowAllocationBytes);
+    let initial_materializations = counter(C::SrvMaterializations);
+    let started = std::time::Instant::now();
+    let warm = host.new_list().unwrap();
+    for (i, title) in titles.iter().enumerate() {
+        if watched(i) {
+            // Touch every committed page before the first watch query. The initial
+            // read of demand-zero backing can appear as a write on Windows.
+            // SAFETY: this test owns the initialized allocation.
+            unsafe { (title.base as *mut u8).write_bytes(0, title.size as usize) };
+        }
+        title.set(0, 13);
+        for local in 0..SLOTS_PER_BUFFER {
+            // Four descriptors form three disjoint intervals, one overlapping.
+            let section = (local / 4 * 3 + (local % 4).min(2)) as u64;
+            let offset = section * 1024 + if local % 4 == 3 { 128 } else { 0 };
+            let index = slot(i, local);
+            let handle = heap.handle(index);
+            title.srv(handle, offset, RANGE_LEN);
+            native.mirror(index, handle, true).unwrap();
+        }
+        crate::shadow::find(title.base, title.size)
+            .unwrap()
+            .refresh(&warm, title.base, title.size);
+    }
+    warm.close();
+    host.execute(&[&warm]);
+    eprintln!(
+        "mixed SRV setup memory={mode} shadow_allocations={} shadow_bytes={} \
+         materialized_descriptors={} populate_bytes={} setup_us={}",
+        counter(C::ShadowAllocations) - initial_allocations,
+        counter(C::ShadowAllocationBytes) - initial_allocation_bytes,
+        counter(C::SrvMaterializations) - initial_materializations,
+        crate::host::test_submission_copy_bytes() - initial_bytes,
+        started.elapsed().as_micros(),
+    );
+
+    // All slots start populated in both cases. The control records identical native
+    // GPU work and conventional refreshes without registering the direct heap.
+    let control = std::env::var("VICTORY_COH_MIXED_CONTROL").as_deref() == Ok("1");
+    let lists: Vec<_> = (0..LISTS)
+        .map(|i| {
+            let list = host.new_list().unwrap();
+            let (output, mapped) = host
+                .shared_buffer(u64::from(DISPATCHES_PER_LIST) * 8)
+                .unwrap();
+            for buffer in 0..CONVENTIONAL {
+                for local in [0, 3, 64, 127] {
+                    let index = slot(buffer, local);
+                    let view = native.mirror(index, heap.handle(index), true).unwrap();
+                    let (address, len) = crate::descriptor::host::buffer_range(&view).unwrap();
+                    crate::shadow::find(address, len)
+                        .unwrap()
+                        .refresh(&list, address, len);
+                }
+            }
+            if !control {
+                let mut state = crate::draw::State::default();
+                state.set_heaps(&[heap.0]);
+                state.bind(&list, &pipeline, true);
+            }
+            // SAFETY: an open list with a live heap, pipeline and output retained by the test.
+            unsafe {
+                let commands = &list.list;
+                if control {
+                    commands.SetDescriptorHeaps(&[Some(native.heap.clone())]);
+                    commands.SetComputeRootSignature(&pipeline.root);
+                    commands.SetPipelineState(&pipeline.pso);
+                }
+                let first = native.heap.GetGPUDescriptorHandleForHeapStart().ptr;
+                let step = host
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                commands.SetComputeRootDescriptorTable(
+                    1,
+                    D3D12_GPU_DESCRIPTOR_HANDLE {
+                        ptr: first + u64::from(slot(i, 0)) * u64::from(step),
+                    },
+                );
+                commands.SetComputeRoot32BitConstant(0, slot(CONVENTIONAL + i, 0), 0);
+                commands.SetComputeRootUnorderedAccessView(2, output.GetGPUVirtualAddress());
+                for dispatch in 0..DISPATCHES_PER_LIST {
+                    commands.SetComputeRoot32BitConstant(0, dispatch, 1);
+                    commands.Dispatch(1, 1, 1);
+                }
+            }
+            list.close();
+            (list, output, mapped)
+        })
+        .collect();
+    let refs: Vec<_> = lists.iter().map(|(list, _, _)| list).collect();
+    let sample = || {
+        let (prep, back) = crate::host::test_submission_counters();
+        [
+            counter(C::DirectSlots),
+            counter(C::DirectRanges),
+            counter(C::DirectRequested),
+            counter(C::DirectBytes),
+            counter(C::DirectUs),
+            counter(C::Refreshes),
+            counter(C::RefreshBytes),
+            counter(C::ConventionalRanges),
+            counter(C::ConventionalRequested),
+            counter(C::ConventionalBytes),
+            counter(C::ConventionalUs),
+            counter(C::Checked),
+            counter(C::Unchanged),
+            counter(C::ShadowAllocations),
+            counter(C::SrvMaterializations),
+            prep,
+            back,
+            crate::host::test_submission_copy_bytes(),
+        ]
+    };
+
+    for dirty in [false, true] {
+        let before = sample();
+        let started = std::time::Instant::now();
+        for run in 0..RUNS {
+            if dirty {
+                titles[0].set(0, 500 + run as u32);
+                titles[CONVENTIONAL].set(0, 500 + run as u32);
+            }
+            host.execute(&refs);
+        }
+        let wall_us = started.elapsed().as_micros();
+        let after = sample();
+        let [
+            slots,
+            direct_ranges,
+            direct_requested,
+            direct,
+            direct_us,
+            conventional_calls,
+            conventional_scheduled,
+            conventional_ranges,
+            conventional_requested,
+            conventional,
+            conventional_us,
+            watched_checked,
+            watched_unchanged,
+            shadow_allocations,
+            srv_materializations,
+            prep_us,
+            copyback,
+            total,
+        ] = std::array::from_fn(|i| after[i] - before[i]);
+        let (_, _, mapped) = lists[0];
+        let gpu_direct = read(mapped);
+        // SAFETY: the validated shader wrote two dwords to the live output mapping.
+        let gpu_conventional = read(unsafe { mapped.add(4) });
+        let expected = if dirty { 500 + RUNS as u32 - 1 } else { 13 };
+        assert_eq!(gpu_direct, if control { 13 } else { expected });
+        assert_eq!(gpu_conventional, expected);
+        assert_eq!(conventional_calls, (RUNS * LISTS * CONVENTIONAL * 4) as u64);
+        assert_eq!(total, conventional + direct);
+        assert_eq!((shadow_allocations, srv_materializations), (0, 0));
+        let watched_copied = watched_checked - watched_unchanged;
+        eprintln!(
+            "mixed SRV bench memory={mode} control={control} dirty={dirty} runs={RUNS} lists={LISTS} \
+             dispatches={} shadows={BUFFERS} logical_shadow_bytes={} heap_slots={HEAP_CAPACITY} populated_slots={} \
+             slots={slots} direct_ranges={direct_ranges} conventional_calls={conventional_calls} \
+             conventional_scheduled={conventional_scheduled} conventional_ranges={conventional_ranges} \
+             conventional_requested={conventional_requested} conventional_bytes={conventional} conventional_us={conventional_us} \
+             direct_requested={direct_requested} direct_bytes={direct} direct_us={direct_us} \
+             prep_bytes={total} prep_us={prep_us} \
+             watched_checked={watched_checked} watched_bytes={watched_copied} unwatched_bytes={} \
+             copyback={copyback} wall_us={wall_us} gpu_direct={gpu_direct} gpu_conventional={gpu_conventional}",
+            RUNS * LISTS * DISPATCHES_PER_LIST as usize,
+            BUFFERS as u64 * 2 * PAGE,
+            BUFFERS * SLOTS_PER_BUFFER,
+            total - watched_copied,
+        );
+    }
+
+    // Check a GPU-produced input through the same recorded lists, outside the timings.
+    let title = &titles[CONVENTIONAL];
+    let shadow = crate::shadow::find(title.base, 4).unwrap();
+    let producer = host.new_list().unwrap();
+    let (input, source) = host.shared_buffer(4).unwrap();
+    shadow.gpu_writes(&producer, title.base, 4);
+    // SAFETY: live mappings and lists, with the explicit copy-to-SRV transition.
+    unsafe {
+        source.cast::<u32>().write(733);
+        producer
+            .list
+            .CopyBufferRegion(&shadow.buffer, 0, &input, 0, 4);
+        producer.list.ResourceBarrier(&[crate::host::transition(
+            &shadow.buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        )]);
+    }
+    producer.close();
+    host.execute(&[&producer, refs[0]]);
+    assert_eq!(read(lists[0].2), 733);
+    assert_eq!(read(title.base as *mut u8), 733);
 }
