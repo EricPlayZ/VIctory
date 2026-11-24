@@ -28,10 +28,66 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// Whether every watch page of `[start, end)` is in one committed private
+/// region. A failed query for a subrange then cannot have crossed a region
+/// boundary or encountered an unmapped page elsewhere in the shadow.
+pub(crate) fn private_region_covers(
+    start: usize,
+    end: usize,
+    observed: Option<MemoryRegion>,
+) -> bool {
+    let start = start / PAGE * PAGE;
+    let Some(end) = end.checked_next_multiple_of(PAGE) else {
+        return false;
+    };
+    observed
+        .filter(|region| region.contains(start))
+        .or_else(|| memory_region(start))
+        .is_some_and(|region| region.committed_private && region.end >= end)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MemoryRegion {
+    start: usize,
+    pub(crate) end: usize,
+    pub(crate) committed_private: bool,
+    pub(crate) reserved: bool,
+    mapped: bool,
+}
+
+impl MemoryRegion {
+    pub(crate) fn contains(self, address: usize) -> bool {
+        (self.start..self.end).contains(&address)
+    }
+}
+
+/// The forward extent of the current mapping with the same attributes.
+pub(crate) fn memory_region(start: usize) -> Option<MemoryRegion> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: a query of the virtual address, without reading its memory.
+    unsafe {
+        let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(start as *const _, &mut info, size_of_val(&info)) == 0 {
+            return None;
+        }
+        let low = info.BaseAddress as usize;
+        let end = low.checked_add(info.RegionSize)?;
+        (low <= start && end > start).then_some(MemoryRegion {
+            start: low,
+            end,
+            committed_private: info.State == MEM_COMMIT && info.Type == MEM_PRIVATE,
+            reserved: info.State == MEM_RESERVE,
+            mapped: info.Type == MEM_MAPPED,
+        })
+    }
+}
+
 struct Journal {
-    /// Numbers the askings; 0 is "never".
+    /// Numbers watch queries and remap notifications; 0 is "never".
     asked: u64,
-    /// Page number → the asking that last found it written.
+    /// Page number → the last recorded write or remap.
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
@@ -49,35 +105,77 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    query(start, end, guarded, false, None)
+}
+
+/// Export the first mapping checked for the guard fallback to buffer
+/// refreshes, which can reuse it without another VirtualQuery.
+pub(crate) fn shadow_writes(
+    start: usize,
+    end: usize,
+    region: &mut Option<MemoryRegion>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    query(start, end, true, false, Some(region))
+}
+
+/// Queries one bounded span where the individual ranges may belong to
+/// separate reservations. A failed probe leaves their dirty bits intact.
+pub(crate) fn grouped_writes(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    query(start, end, false, true, None)
+}
+
+fn query(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    preflight: bool,
+    first_region: Option<&mut Option<MemoryRegion>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
+    let capacity = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(capacity.max(j.found.len()), 0);
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
+    let mut ask = |flags| {
+        let mut count = capacity;
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `capacity` entries.
+        let result = unsafe {
+            GetWriteWatch(
+                flags,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        };
+        (result == 0).then_some(count)
+    };
+    // Flags zero tests the full span without clearing its dirty bits. The
+    // second call collects and resets in one operation, including writes
+    // that arrived after the probe. The journal lock serializes our askers.
+    if preflight && ask(0).is_none() {
+        return None;
+    }
+    let (count, guarded) = match ask(WRITE_WATCH_FLAG_RESET) {
+        Some(count) => (count, Vec::new()),
+        None if guarded => {
+            let region = memory_region(first * PAGE)?;
+            let reserved_shadow = first_region.is_some() && region.reserved;
+            if let Some(out) = first_region {
+                *out = Some(region);
+            }
+            if !region.mapped || reserved_shadow {
+                return None;
+            }
+            (0, guard_blocks(first * PAGE, last * PAGE))
         }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        Vec::new()
+        None => return None,
     };
     #[cfg(feature = "diagnostics")]
     {
@@ -122,15 +220,14 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.Type != MEM_MAPPED {
-        return None;
-    }
+    memory_region(start)
+        .filter(|region| region.mapped)
+        .map(|_| guard_blocks(start, end))
+}
+
+fn guard_blocks(start: usize, end: usize) -> Vec<usize> {
     install();
     let mut g = guards();
     let mut written = Vec::new();
@@ -152,7 +249,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             protect(&mut g, from, block);
         }
     }
-    Some(written)
+    written
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
@@ -246,36 +343,61 @@ pub fn writing(at: usize, len: usize) {
     open(&mut guards(), at, at + len);
 }
 
-/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded.
+/// The runtime mapped or unmapped title memory `[at, at + len)`.
+/// The old guards and shadow copies describe the previous mapping.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let mut g = guards();
-    let end = at + len;
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
-    for block in blocks {
-        // A remap covering only part of a guarded block (pages are 4 KiB,
-        // blocks 64 KiB) leaves the rest of the block read-only under its old
-        // mapping: give that part write access back before forgetting the
-        // block, or the title's next write there faults with no guard to
-        // take it.
-        let (from, to) = (block * BLOCK, (block + 1) * BLOCK);
-        let mut old = 0;
-        if from < at {
-            // SAFETY: title view memory we made read-only; only its
-            // protection changes (an unmapped part just fails).
-            unsafe { VirtualProtect(from as *const _, at - from, PAGE_READWRITE, &mut old) };
+    let Some(end) = at.checked_add(len) else {
+        return;
+    };
+    if at == end {
+        return;
+    }
+    // Queries may hold both locks in this order.
+    let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let mut g = guards();
+        let blocks: Vec<usize> = g
+            .protected
+            .range(at / BLOCK..end.div_ceil(BLOCK))
+            .copied()
+            .collect();
+        for block in blocks {
+            // Local fix (held in both A/B builds): a remap covering only part
+            // of a guarded block gives the rest of the block write access back.
+            use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+            let (bf, bt) = (block * BLOCK, (block + 1) * BLOCK);
+            let mut old = 0;
+            if bf < at {
+                // SAFETY: title view memory we made read-only.
+                unsafe { VirtualProtect(bf as *const _, at - bf, PAGE_READWRITE, &mut old) };
+            }
+            if end < bt {
+                // SAFETY: as above.
+                unsafe { VirtualProtect(end as *const _, bt - end, PAGE_READWRITE, &mut old) };
+            }
+            g.protected.remove(&block);
+            g.clean.remove(&block);
         }
-        if end < to {
-            // SAFETY: as above.
-            unsafe { VirtualProtect(end as *const _, to - end, PAGE_READWRITE, &mut old) };
-        }
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    }
+    record_mapping_change(&mut journal, at, end);
+}
+
+/// A private title allocation changed. Write watch can stay clean across a
+/// decommit and recommit, so existing shadows need a new journal generation.
+pub fn title_memory_allocation_changed(at: usize, len: usize) {
+    if let Some(end) = at.checked_add(len)
+        && at < end
+    {
+        let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        record_mapping_change(&mut journal, at, end);
+    }
+}
+
+fn record_mapping_change(journal: &mut Journal, at: usize, end: usize) {
+    journal.asked += 1;
+    let now = journal.asked;
+    for page in at / PAGE..end.div_ceil(PAGE) {
+        journal.written.insert(page, now);
     }
 }
 
@@ -379,10 +501,11 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
@@ -399,12 +522,15 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        let (initial, before) = writes(start, end, false).expect("watched");
+        // The address can have belonged to an earlier test's reservation.
+        // Only this test's write should advance its journal generation.
+        assert!(before.iter().all(|&(_, at)| at < initial));
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let new_writes: Vec<_> = after.into_iter().filter(|&(_, at)| at > initial).collect();
+        assert_eq!(new_writes, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
@@ -463,5 +589,144 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    pub(crate) struct Reservation(pub(crate) *mut std::ffi::c_void);
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            // SAFETY: this is the base of a reservation owned by the test.
+            assert_ne!(unsafe { VirtualFree(self.0, 0, MEM_RELEASE) }, 0);
+        }
+    }
+
+    pub(crate) fn adjacent(watched: usize, unwatched: usize) -> (Reservation, Reservation) {
+        adjacent_reservations(watched, unwatched, false)
+    }
+
+    pub(crate) fn adjacent_reservations(
+        first_len: usize,
+        second_len: usize,
+        second_watched: bool,
+    ) -> (Reservation, Reservation) {
+        for _ in 0..16 {
+            // SAFETY: these independent test reservations use valid allocation flags.
+            unsafe {
+                let span = VirtualAlloc(
+                    std::ptr::null(),
+                    first_len + second_len,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS,
+                );
+                assert!(!span.is_null());
+                assert_ne!(VirtualFree(span, 0, MEM_RELEASE), 0);
+                let first = VirtualAlloc(
+                    span,
+                    first_len,
+                    MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                );
+                if first.is_null() {
+                    continue;
+                }
+                let first = Reservation(first);
+                let second = VirtualAlloc(
+                    span.cast::<u8>().wrapping_add(first_len).cast(),
+                    second_len,
+                    MEM_COMMIT | MEM_RESERVE | if second_watched { MEM_WRITE_WATCH } else { 0 },
+                    PAGE_READWRITE,
+                );
+                if !second.is_null() {
+                    return (first, Reservation(second));
+                }
+            }
+        }
+        panic!("adjacent test reservations");
+    }
+
+    #[test]
+    fn grouped_probe_preserves_dirty_pages_in_adjacent_allocations() {
+        for second_watched in [false, true] {
+            let (first, second) = adjacent_reservations(PAGE, PAGE, second_watched);
+            let base = first.0 as usize;
+            let next = second.0 as usize;
+            let (before, _) = writes(base, next, false).unwrap();
+            // SAFETY: each pointer starts its own live reservation.
+            unsafe {
+                first.0.cast::<u8>().write(1);
+                second.0.cast::<u8>().write(2);
+            }
+            assert!(grouped_writes(base, next + PAGE).is_none());
+            let (now, first_writes) = writes(base, next, false).unwrap();
+            assert!(now > before);
+            assert_eq!(first_writes, [(base / PAGE, now)]);
+            if second_watched {
+                let (now, second_writes) = writes(next, next + PAGE, false).unwrap();
+                assert_eq!(second_writes, [(next / PAGE, now)]);
+            } else {
+                assert!(writes(next, next + PAGE, false).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unwatched_subrange_does_not_disable_watch_elsewhere_in_shadow() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let watched = 16 << 20;
+        let (first, second) = adjacent(watched, PAGE);
+        let start = first.0 as usize;
+        let len = (watched + PAGE) as u64;
+        struct RegisteredBuffer(usize);
+        impl Drop for RegisteredBuffer {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0, self.0 as u64);
+            }
+        }
+        crate::shadow::register(start, start as u64, len);
+        let _registration = RegisteredBuffer(start);
+        // SAFETY: both reservations are live. Populate demand-zero pages
+        // before the first refresh, since touching them can trip write watch.
+        unsafe {
+            first.0.cast::<u8>().write_bytes(0, watched);
+            first.0.cast::<u32>().write(13);
+            second.0.cast::<u32>().write(27);
+        }
+        let shadow = crate::shadow::find(start as u64, len).unwrap();
+        assert_eq!(shadow.update(start, watched), watched);
+        assert_eq!(shadow.update(start, watched), 0);
+
+        // A small view in the next allocation needs the CPU fallback. A large
+        // conventional view on the same shadow can still use write watching.
+        assert_eq!(shadow.update(second.0 as usize, 4), 4);
+        let refreshed: usize = (0..4).map(|_| shadow.update(start, watched)).sum();
+        eprintln!(
+            "4-byte unwatched refresh, then 4 clean watched requests copied {refreshed} bytes"
+        );
+        assert_eq!(refreshed, 0);
+
+        // SAFETY: the first allocation remains live.
+        unsafe { first.0.cast::<u32>().write(500) };
+        assert_eq!(shadow.update(start, watched), PAGE);
+        // SAFETY: the persistently mapped shadow owns the refreshed word.
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the live buffer contains the refreshed word. No GPU work is in flight.
+        unsafe {
+            shadow.buffer.Map(0, None, Some(&mut data)).unwrap();
+            let word = data.cast::<u32>().read_unaligned();
+            shadow.buffer.Unmap(0, None);
+            assert_eq!(word, 500);
+        }
+
+        // The ordinary suffix still needs copying. The watched prefix
+        // stays valid, including when the two are requested together.
+        assert_eq!(shadow.update(start + watched - 4, 8), 4);
+        assert_eq!(shadow.update(start, watched), 0);
+        // SAFETY: the last byte of the live watched reservation.
+        unsafe { first.0.cast::<u8>().add(watched - 1).write(9) };
+        assert_eq!(shadow.update(start + watched - 4, 8), 8);
+        assert_eq!(shadow.update(start, watched), PAGE - 4);
+        assert_eq!(shadow.update(start, watched), 0);
     }
 }
