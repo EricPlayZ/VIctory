@@ -243,6 +243,12 @@ extern "system" fn present(
     _parameters: *const u8,
 ) -> HRESULT {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        static LAST_PLANES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+        if LAST_PLANES.swap(planes, Ordering::Relaxed) != planes {
+            tracing::info!(frame, planes, "local diag: present plane count changed");
+        }
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

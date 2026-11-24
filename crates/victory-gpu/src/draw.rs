@@ -522,6 +522,22 @@ impl State {
         self.bind(list, p, true);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        {
+            // Local diag: the largest dispatch per pipeline (groups), logged
+            // when it grows past 4096 groups.
+            static BIGGEST: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+                std::sync::Mutex::new(None);
+            let groups = u64::from(x) * u64::from(y) * u64::from(z);
+            if groups > 4096 {
+                let mut m = BIGGEST.lock().unwrap_or_else(|e| e.into_inner());
+                let e = m.get_or_insert_with(Default::default).entry(p.name.clone()).or_insert(0);
+                if groups > *e {
+                    *e = groups;
+                    tracing::info!(x, y, z, groups, pipeline = %p.name, "local diag: big dispatch");
+                }
+            }
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);

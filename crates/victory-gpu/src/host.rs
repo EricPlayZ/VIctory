@@ -111,6 +111,16 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    // Diagnostics: give a GPU crash dump tool (Nsight Aftermath) time to
+    // collect the dump in this process before it ends.
+    #[cfg(feature = "diagnostics")]
+    if let Some(secs) = std::env::var("VICTORY_DEVICE_LOST_WAIT")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        tracing::error!(secs, "waiting before ending the run (VICTORY_DEVICE_LOST_WAIT)");
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -1288,15 +1298,18 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
     let mut merged_count = 0u64;
     #[cfg(feature = "diagnostics")]
     let mut requested = 0usize;
-    crate::descriptor::with_live_views(|live| {
+    crate::watch::pass(|| crate::descriptor::with_live_views(|live| {
         let mut pending: Option<(&Arc<crate::shadow::Shadow>, usize, usize)> = None;
         for (key, range) in &ranges {
             if !live(*key) || range.address == range.end {
                 continue;
             }
+            // Views whose pages touch join: the refresh is by whole pages
+            // anyway (`Shadow::update`), and each range costs a lock and a
+            // write-watch query (~1 million small views per world frame).
             if let Some((shadow, _, end)) = &mut pending
                 && Arc::ptr_eq(shadow, &range.shadow)
-                && range.address <= *end
+                && range.address / crate::watch::PAGE <= end.div_ceil(crate::watch::PAGE)
             {
                 *end = (*end).max(range.end);
                 continue;
@@ -1320,7 +1333,7 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
                 requested += end - start;
             }
         }
-    });
+    }));
     let elapsed = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
     {

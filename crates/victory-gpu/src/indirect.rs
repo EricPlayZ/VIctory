@@ -97,10 +97,25 @@ fn make() -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
+    // Diagnostics: `VICTORY_INDIRECT_BUDGET` and `VICTORY_INDIRECT_GROUPS`
+    // (powers of two) tighten the list budget and per-dispatch groups.
+    #[allow(unused_mut)]
+    let mut source = SOURCE.to_owned();
+    #[cfg(feature = "diagnostics")]
+    for (var, from) in [
+        ("VICTORY_INDIRECT_BUDGET", "BUDGET = 1u << 27"),
+        ("VICTORY_INDIRECT_GROUPS", "GROUPS = 1u << 20"),
+    ] {
+        if let Some(n) = std::env::var(var).ok().and_then(|v| v.parse::<u32>().ok()) {
+            let name = from.split(' ').next().unwrap_or_default();
+            source = source.replace(from, &format!("{name} = 1u << {n}"));
+            tracing::warn!(var, n, "local diag: indirect clamp tightened");
+        }
+    }
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,

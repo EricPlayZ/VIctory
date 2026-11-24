@@ -58,13 +58,58 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// During a refresh pass ([`pass`]): page ranges `start → end` the
+    /// kernel was asked about in it, answered from the journal again.
+    pass: Option<BTreeMap<usize, usize>>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    pass: None,
 });
+
+/// Runs `f` as one refresh pass: a page range the kernel was asked about
+/// once in it is not asked about again (the world refreshes ~240,000 views
+/// a frame, most inside one 174 MB heap, and each asking walks every 4 KiB
+/// page of its range). A write landing after the first asking is reported
+/// at the next pass, as one landing just after any asking is.
+pub(crate) fn pass<T>(f: impl FnOnce() -> T) -> T {
+    let lock = || JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    lock().pass = Some(BTreeMap::new());
+    let out = f();
+    lock().pass = None;
+    out
+}
+
+/// Whether `[first, last)` (pages) lies in ranges asked about in this pass.
+fn asked_in_pass(pass: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
+    let mut at = first;
+    while at < last {
+        match pass.range(..=at).next_back() {
+            Some((_, &end)) if end > at => at = end,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Notes `[first, last)` (pages) as asked about, joining touching ranges.
+fn note_asked(pass: &mut BTreeMap<usize, usize>, mut first: usize, mut last: usize) {
+    let touching: Vec<(usize, usize)> = pass
+        .range(..=last)
+        .rev()
+        .take_while(|&(_, &end)| end >= first)
+        .map(|(&s, &e)| (s, e))
+        .collect();
+    for (s, e) in touching {
+        pass.remove(&s);
+        first = first.min(s);
+        last = last.max(e);
+    }
+    pass.insert(first, last);
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -77,6 +122,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    if let Some(pass) = &j.pass
+        && asked_in_pass(pass, first, last)
+    {
+        return Some((
+            j.asked,
+            j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
+        ));
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -110,6 +163,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
+    if !failed
+        && let Some(pass) = &mut j.pass
+    {
+        note_asked(pass, first, last);
+    }
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
@@ -423,16 +481,20 @@ pub(crate) mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The journal outlives allocations: pages an earlier test wrote at
+        // this address may be listed, with older askings than this test's.
+        let (first, _) = writes(start, end, false).expect("watched");
+        let since = |pages: Vec<(usize, u64)>| -> Vec<(usize, u64)> {
+            pages.into_iter().filter(|&(_, w)| w > first).collect()
+        };
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        assert_eq!(since(after), [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
-        assert_eq!(again, [(p / PAGE + 1, now)]);
+        assert_eq!(since(again), [(p / PAGE + 1, now)]);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -562,9 +624,10 @@ pub(crate) mod tests {
         assert_eq!(shadow.update(start, watched), watched);
         assert_eq!(shadow.update(start, watched), 0);
 
-        // A small view in the next allocation needs the CPU fallback. A large
-        // conventional view on the same shadow can still use write watching.
-        assert_eq!(shadow.update(second.0 as usize, 4), 4);
+        // A small view in the next allocation is copied as its whole page
+        // (guarded there). A large conventional view on the same shadow can
+        // still use write watching.
+        assert_eq!(shadow.update(second.0 as usize, 4), PAGE);
         let refreshed: usize = (0..4).map(|_| shadow.update(start, watched)).sum();
         eprintln!(
             "4-byte unwatched refresh, then 4 clean watched requests copied {refreshed} bytes"
@@ -584,10 +647,10 @@ pub(crate) mod tests {
             assert_eq!(word, 500);
         }
 
-        // A later fallback crossing into the watched allocation invalidates
-        // that page's generation without affecting the remaining pages.
-        assert_eq!(shadow.update(start + watched - 4, 8), 8);
-        assert_eq!(shadow.update(start, watched), PAGE);
+        // A later small refresh across the allocations' border copies both
+        // pages whole once; the watched one is then current, not refetched.
+        assert_eq!(shadow.update(start + watched - 4, 8), 2 * PAGE);
         assert_eq!(shadow.update(start, watched), 0);
+        assert_eq!(shadow.update(start + watched - 4, 8), 0);
     }
 }
