@@ -129,12 +129,13 @@ pub extern "system" fn XMemVirtualAlloc(
     let constrained = base.is_null();
     if constrained {
         kind |= MEM_RESERVE;
-        // The GPU side copies only the pages the title wrote since its last
-        // copy (`victory_gpu`, decision 0007); placeholders cannot be
-        // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
-            kind |= MEM_WRITE_WATCH;
-        }
+    }
+    // The GPU side copies only the pages the title wrote since its last
+    // copy (`victory_gpu`, decision 0007); placeholders cannot be watched
+    // (their physical-page views are guarded). A reservation at the title's
+    // address is watched too: unwatched memory is copied whole every time.
+    if kind & MEM_RESERVE != 0 && kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        kind |= MEM_WRITE_WATCH;
     }
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
@@ -163,6 +164,85 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     at
+}
+
+/// The title's `VirtualAlloc` (`api-ms-win-core-memory`), the host's with
+/// new reservations write-watched: the GPU side copies only the pages the
+/// title wrote since its last copy, and unwatched memory whole every time
+/// (in the world the title's own small reservations among watched ones
+/// left ~2.4 GB a frame to copy). Large-page, physical, reset and
+/// placeholder requests, which cannot be watched, and any request the host
+/// refuses watched, go through as the title made them.
+pub extern "system" fn TitleVirtualAlloc(
+    address: *const c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+) -> *mut c_void {
+    const MEM_PHYSICAL: u32 = 0x40_0000;
+    const MEM_LARGE_PAGES: u32 = 0x2000_0000;
+    const MEM_RESET: u32 = 0x8_0000;
+    const MEM_RESET_UNDO: u32 = 0x100_0000;
+    let unwatchable = MEM_PHYSICAL | MEM_LARGE_PAGES | MEM_RESET | MEM_RESET_UNDO | MEM_RESERVE_PLACEHOLDER;
+    if kind & MEM_RESERVE != 0 && kind & unwatchable == 0 {
+        // SAFETY: the title's own arguments, with only write watching added.
+        let at = unsafe { VirtualAlloc(address, size, kind | MEM_WRITE_WATCH, protect) };
+        if !at.is_null() {
+            return at;
+        }
+    }
+    // SAFETY: the title's own arguments.
+    unsafe { VirtualAlloc(address, size, kind, protect) }
+}
+
+/// The title's memory imports we change (see [`TitleVirtualAlloc`]); the
+/// others go to the host.
+pub(crate) fn memory_module() -> HleModule {
+    HleModule {
+        name: "memory",
+        dlls: &["api-ms-win-core-memory-*", "kernel32.dll", "kernelbase.dll"],
+        exports: vec![crate::HleExport {
+            name: "VirtualAlloc",
+            address: TitleVirtualAlloc as *const () as usize,
+        }],
+    }
+}
+
+#[cfg(test)]
+mod title_virtual_alloc_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+
+    fn watched(at: *mut c_void, size: usize) -> bool {
+        let mut found = [0usize; 16];
+        let (mut count, mut granularity) = (found.len(), 0);
+        // SAFETY: an answer buffer of `count` entries.
+        unsafe {
+            GetWriteWatch(0, at, size, found.as_mut_ptr().cast(), &mut count, &mut granularity) == 0
+        }
+    }
+
+    #[test]
+    fn reservations_are_write_watched() {
+        let at = TitleVirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        assert!(!at.is_null());
+        assert!(watched(at, 64 << 10));
+        // SAFETY: ours.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn commits_in_a_reservation_still_work() {
+        let at = TitleVirtualAlloc(std::ptr::null(), 128 << 10, MEM_RESERVE, PAGE_NOACCESS);
+        assert!(!at.is_null());
+        let page = TitleVirtualAlloc(at, 64 << 10, MEM_COMMIT, PAGE_READWRITE);
+        assert_eq!(page, at);
+        // SAFETY: committed above.
+        unsafe { page.cast::<u32>().write(7) };
+        assert!(watched(at, 128 << 10));
+        // SAFETY: ours.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+    }
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
