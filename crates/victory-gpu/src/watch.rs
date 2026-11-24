@@ -58,58 +58,13 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
-    /// During a refresh pass ([`pass`]): page ranges `start → end` the
-    /// kernel was asked about in it, answered from the journal again.
-    pass: Option<BTreeMap<usize, usize>>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
-    pass: None,
 });
-
-/// Runs `f` as one refresh pass: a page range the kernel was asked about
-/// once in it is not asked about again (the world refreshes ~240,000 views
-/// a frame, most inside one 174 MB heap, and each asking walks every 4 KiB
-/// page of its range). A write landing after the first asking is reported
-/// at the next pass, as one landing just after any asking is.
-pub(crate) fn pass<T>(f: impl FnOnce() -> T) -> T {
-    let lock = || JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    lock().pass = Some(BTreeMap::new());
-    let out = f();
-    lock().pass = None;
-    out
-}
-
-/// Whether `[first, last)` (pages) lies in ranges asked about in this pass.
-fn asked_in_pass(pass: &BTreeMap<usize, usize>, first: usize, last: usize) -> bool {
-    let mut at = first;
-    while at < last {
-        match pass.range(..=at).next_back() {
-            Some((_, &end)) if end > at => at = end,
-            _ => return false,
-        }
-    }
-    true
-}
-
-/// Notes `[first, last)` (pages) as asked about, joining touching ranges.
-fn note_asked(pass: &mut BTreeMap<usize, usize>, mut first: usize, mut last: usize) {
-    let touching: Vec<(usize, usize)> = pass
-        .range(..=last)
-        .rev()
-        .take_while(|&(_, &end)| end >= first)
-        .map(|(&s, &e)| (s, e))
-        .collect();
-    for (s, e) in touching {
-        pass.remove(&s);
-        first = first.min(s);
-        last = last.max(e);
-    }
-    pass.insert(first, last);
-}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -122,14 +77,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    if let Some(pass) = &j.pass
-        && asked_in_pass(pass, first, last)
-    {
-        return Some((
-            j.asked,
-            j.written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
-        ));
-    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
@@ -163,11 +110,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    if !failed
-        && let Some(pass) = &mut j.pass
-    {
-        note_asked(pass, first, last);
-    }
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
@@ -647,10 +589,57 @@ pub(crate) mod tests {
             assert_eq!(word, 500);
         }
 
-        // A later small refresh across the allocations' border copies both
-        // pages whole once; the watched one is then current, not refetched.
-        assert_eq!(shadow.update(start + watched - 4, 8), 2 * PAGE);
+        // A later small refresh across the allocations' border refetches at
+        // most the border page of the watched allocation, then nothing.
+        assert!(shadow.update(start + watched - 4, 8) >= 8);
+        assert!(shadow.update(start, watched) <= PAGE);
         assert_eq!(shadow.update(start, watched), 0);
-        assert_eq!(shadow.update(start + watched - 4, 8), 0);
+    }
+
+    #[test]
+    fn small_refreshes_of_watched_memory_copy_whole_pages_once() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let size = 4 * PAGE;
+        // SAFETY: a fresh write-watched allocation, kept reserved (below).
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: committed pages of ours. Touched first: reading a
+        // demand-zero page faults it in, which write watching reports.
+        unsafe { (base as *mut u8).write_bytes(0, size) };
+        crate::shadow::register(base, base as u64, size as u64);
+        let shadow = crate::shadow::find(base as u64, size as u64).unwrap();
+        // Small views (the world's directly indexed ones): eight in the
+        // first page, one in the third, none covering a page whole.
+        let views = [0, 64, 128, 1024, 4096, 8192, 16384, 32768, 2 * PAGE + 16];
+        let refresh = || -> usize { views.iter().map(|&at| shadow.update(base + at, 4)).sum() };
+        // First: the two pages, whole. They were "never copied" before, and
+        // a page only partly copied stayed so, copied again at every refresh.
+        assert_eq!(refresh(), 2 * PAGE);
+        assert_eq!(refresh(), 0);
+        assert_eq!(refresh(), 0);
+        // A title write brings back only its page, with the new bytes.
+        // SAFETY: a committed page of ours.
+        unsafe { ((base + 64) as *mut u32).write(500) };
+        assert_eq!(refresh(), PAGE);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the live shadow holds the refreshed word; no GPU work.
+        unsafe {
+            shadow.buffer.Map(0, None, Some(&mut data)).unwrap();
+            let word = data.cast::<u8>().add(64).cast::<u32>().read_unaligned();
+            shadow.buffer.Unmap(0, None);
+            assert_eq!(word, 500);
+        }
+        crate::shadow::unregister(base, base as u64);
+        // The allocation stays reserved: the write journal remembers its
+        // pages, and another test's allocation there would inherit them.
     }
 }

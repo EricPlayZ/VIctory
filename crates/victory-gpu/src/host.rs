@@ -1333,7 +1333,7 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
     let mut merged_count = 0u64;
     #[cfg(feature = "diagnostics")]
     let mut requested = 0usize;
-    crate::watch::pass(|| crate::descriptor::with_live_views(|live| {
+    crate::descriptor::with_live_views(|live| {
         let mut pending: Option<(&Arc<crate::shadow::Shadow>, usize, usize)> = None;
         for (key, range) in &ranges {
             if !live(*key) || range.address == range.end {
@@ -1368,7 +1368,7 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
                 requested += end - start;
             }
         }
-    }));
+    });
     let elapsed = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
     {

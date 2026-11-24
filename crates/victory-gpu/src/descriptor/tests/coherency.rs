@@ -283,54 +283,6 @@ fn directly_indexed_srv_reads_cpu_changes_without_remirroring() {
     assert_eq!(unsafe { mapped.cast::<u32>().read() }, 500);
 }
 
-#[cfg(feature = "diagnostics")]
-#[test]
-fn directly_indexed_small_watched_views_are_copied_once() {
-    let Some((host, dxc)) = test_host() else {
-        return;
-    };
-    use crate::copystat::{C, read as counter};
-    const PAGE: u64 = crate::watch::PAGE as u64;
-    let pipeline = pipeline(host, &dxc);
-    let title = TitleBuffer::watched(4 * PAGE);
-    // SAFETY: the test owns the committed allocation. Touched first: reading
-    // a demand-zero page faults it in, which write watching reports.
-    unsafe { (title.base as *mut u8).write_bytes(0, 4 * PAGE as usize) };
-    title.set(0, 13);
-    let heap_owner = TestHeap::new(64);
-    // Eight 4-byte views in the first page and one in the third, none
-    // covering a page whole (the world's directly indexed views).
-    for (n, offset) in [0, 64, 128, 1024, 4096, 8192, 16384, 32768, 2 * PAGE + 16]
-        .into_iter()
-        .enumerate()
-    {
-        title.srv(heap_owner.handle(17 + n as u32), offset, 4);
-    }
-    let (output, mapped) = host.shared_buffer(4).unwrap();
-    let submit = || {
-        let list = host.new_list().unwrap();
-        record(&list, heap_owner.0, &pipeline, 17, &output);
-        list.close();
-        let before = counter(C::DirectBytes);
-        host.execute(&[&list]);
-        counter(C::DirectBytes) - before
-    };
-    // The first submission copies the two pages the views touch, whole.
-    assert_eq!(submit(), 2 * PAGE);
-    assert_eq!(read(mapped), 13);
-    // Unwritten since, they are not copied again.
-    assert_eq!(submit(), 0);
-    assert_eq!(submit(), 0);
-    // A title write brings back only its page.
-    title.set(0, 500);
-    assert_eq!(submit(), PAGE);
-    assert_eq!(read(mapped), 500);
-    // Kept reserved: the write journal remembers these pages, and a later
-    // test's fresh allocation at the same address would inherit them.
-    crate::shadow::unregister(title.base as usize, title.base);
-    std::mem::forget(title);
-}
-
 fn read(mapped: *mut u8) -> u32 {
     // SAFETY: tests call after the submission returns while the buffer lives.
     unsafe { mapped.cast::<u32>().read() }
