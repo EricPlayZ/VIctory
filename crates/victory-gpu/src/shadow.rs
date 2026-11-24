@@ -363,6 +363,7 @@ impl Shadow {
         {
             add(C::UnwatchedRanges, 1);
             add(C::UnwatchedBytes, (to - from) as u64);
+            crate::copystat::watch_failed_kind(from, to);
         }
         self.copy(from, to);
         to - from

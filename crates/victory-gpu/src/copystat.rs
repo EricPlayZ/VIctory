@@ -131,6 +131,66 @@ pub(crate) fn watch_failed(shadow: usize, requested: usize) {
     *bytes += requested as u64;
 }
 
+/// Local diag: what memory the failed write-watch probes were over, by
+/// (start type, end type, one allocation?, allocation base, its size).
+static FAILED_KINDS: std::sync::Mutex<Option<std::collections::HashMap<(u32, u32, bool, usize, usize), (u64, u64)>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn watch_failed_kind(from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let query = |at: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        info
+    };
+    let (a, b) = (query(from), query(to - 1));
+    let base = a.AllocationBase as usize;
+    // The allocation's extent: walk its regions (diagnostics only).
+    let mut size = 0usize;
+    let mut at = base;
+    loop {
+        let r = query(at);
+        if r.AllocationBase as usize != base || r.RegionSize == 0 {
+            break;
+        }
+        size += r.RegionSize;
+        at += r.RegionSize;
+        if size > 64 << 30 {
+            break;
+        }
+    }
+    let key = (a.Type, b.Type, base == b.AllocationBase as usize, base, size);
+    let mut m = FAILED_KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = m.get_or_insert_with(Default::default).entry(key).or_default();
+    e.0 += 1;
+    e.1 += (to - from) as u64;
+}
+
+fn log_failed_kinds() {
+    let Some(m) = FAILED_KINDS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut v: Vec<_> = m.into_iter().collect();
+    v.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+    let name = |t: u32| match t {
+        0x20000 => "private",
+        0x40000 => "mapped",
+        0x1000000 => "image",
+        0 => "free",
+        _ => "other",
+    };
+    for ((ta, tb, one, base, size), (n, bytes)) in v.into_iter().take(12) {
+        tracing::info!(
+            "local diag: failed watch over {}..{} (one allocation {one}), allocation {base:#x}+{size:#x}: {n} probes, {:.1} MB",
+            name(ta),
+            name(tb),
+            bytes as f64 / 1e6
+        );
+    }
+}
+
 fn page_faults() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
@@ -148,6 +208,7 @@ fn page_faults() -> u64 {
 /// Logs the counters per frame over `frames` frames, and the ranges that
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
+    log_failed_kinds();
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);

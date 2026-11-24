@@ -93,6 +93,34 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    // The kernel answers for one allocation at a time, and the title's
+    // buffers span many of its small ones (64 KiB, each watched): a range
+    // over several is asked about page by page (allocations start on
+    // 64 KiB). Copying such ranges whole was ~2.4 GB a world frame.
+    let failed = if failed && last - first > 1 {
+        match by_page(first, last) {
+            Ok(found) => {
+                count = found.len();
+                j.found.resize(count.max(j.found.len()), 0);
+                j.found[..count].copy_from_slice(&found);
+                false
+            }
+            Err(found) => {
+                // Pages asked about before one that is not watched: their
+                // writes are now cleared in the kernel, so the journal keeps
+                // them.
+                if !found.is_empty() {
+                    j.asked += 1;
+                    for at in found {
+                        j.written.insert(at / PAGE, j.asked);
+                    }
+                }
+                true
+            }
+        }
+    } else {
+        failed
+    };
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -121,6 +149,36 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// The written kernel pages (addresses) of pages `[first, last)`, asking
+/// the kernel page by page and clearing what it reports; `Err` with what
+/// was found before a page that is not write-watched.
+fn by_page(first: usize, last: usize) -> Result<Vec<usize>, Vec<usize>> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut found = Vec::new();
+    let mut answer = [0usize; PAGE / KERNEL_PAGE];
+    for page in first..last {
+        let mut count = answer.len();
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (page * PAGE) as *const _,
+                PAGE,
+                answer.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        if failed {
+            return Err(found);
+        }
+        found.extend_from_slice(&answer[..count]);
+    }
+    Ok(found)
 }
 
 /// Guarded blocks of view memory.
@@ -594,6 +652,62 @@ pub(crate) mod tests {
         assert!(shadow.update(start + watched - 4, 8) >= 8);
         assert!(shadow.update(start, watched) <= PAGE);
         assert_eq!(shadow.update(start, watched), 0);
+    }
+
+    /// Two adjacent allocations, the first write-watched, the second
+    /// write-watched if `watched`, each one page; kept reserved (the journal
+    /// remembers their pages).
+    fn neighbours(watched: bool) -> usize {
+        for _ in 0..16 {
+            // SAFETY: plain test reservations.
+            unsafe {
+                let span = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS);
+                assert!(!span.is_null());
+                assert_ne!(VirtualFree(span, 0, MEM_RELEASE), 0);
+                let kind = MEM_RESERVE | MEM_COMMIT;
+                let a = VirtualAlloc(span, PAGE, kind | MEM_WRITE_WATCH, PAGE_READWRITE);
+                if a.is_null() {
+                    continue;
+                }
+                let second = span.cast::<u8>().add(PAGE).cast();
+                let b = VirtualAlloc(second, PAGE, kind | if watched { MEM_WRITE_WATCH } else { 0 }, PAGE_READWRITE);
+                if b.is_null() {
+                    VirtualFree(a, 0, MEM_RELEASE);
+                    continue;
+                }
+                return span as usize;
+            }
+        }
+        panic!("no two adjacent allocations");
+    }
+
+    #[test]
+    fn a_range_over_watched_allocations_is_asked_page_by_page() {
+        let p = neighbours(true);
+        let (start, end) = (p, p + 2 * PAGE);
+        let (before, _) = writes(start, end, false).expect("watched, page by page");
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((p + 8) as *mut u8).write(1);
+            ((p + PAGE + 8) as *mut u8).write(1);
+        }
+        let (now, after) = writes(start, end, false).expect("watched, page by page");
+        let after: Vec<_> = after.into_iter().filter(|&(_, w)| w > before).collect();
+        assert_eq!(after, [(p / PAGE, now), (p / PAGE + 1, now)]);
+    }
+
+    #[test]
+    fn a_write_found_before_an_unwatched_page_is_kept() {
+        let p = neighbours(false);
+        let (before, _) = writes(p, p + PAGE, false).expect("watched");
+        // SAFETY: a committed page of ours.
+        unsafe { ((p + 8) as *mut u8).write(1) };
+        // The second allocation is not watched: refused, as before.
+        assert!(writes(p, p + 2 * PAGE, false).is_none());
+        // The first page's write was cleared in the kernel by that asking;
+        // the journal still has it.
+        let (_, again) = writes(p, p + PAGE, false).expect("watched");
+        assert!(again.iter().any(|&(page, w)| page == p / PAGE && w > before));
     }
 
     #[test]
