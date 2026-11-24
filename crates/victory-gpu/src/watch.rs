@@ -317,12 +317,12 @@ fn install() {
         if readonly_view(at) {
             #[cfg(feature = "diagnostics")]
             unguarded_write(at);
+            // `g` is still held (since the checks above): taking it again
+            // would deadlock the faulting thread.
             let block = at / BLOCK;
-            let mut g = guards();
             g.protected.remove(&block);
             g.clean.remove(&block);
             open_views(block * BLOCK, (block + 1) * BLOCK);
-            drop(g);
             if writable(at) {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
