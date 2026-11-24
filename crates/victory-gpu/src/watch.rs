@@ -58,12 +58,17 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Pages found reserved but not committed (no data; placeholders the
+    /// title maps physical pages into later): reported written once they
+    /// hold memory.
+    holes: BTreeSet<usize>,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    holes: BTreeSet::new(),
 });
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -93,13 +98,33 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
-    let guarded = if failed {
+    // Not one write-watched allocation: a view is guarded whole, as before.
+    // Otherwise the range is asked about page by page (allocations start on
+    // 64 KiB): the title's buffers span many of its small allocations, some
+    // reserved but not mapped yet, and copying such ranges whole was
+    // ~4-5 GB a world frame, mostly of unmapped holes.
+    let mut by_pages = Vec::new();
+    let guarded = if !failed {
+        Vec::new()
+    } else if let Some(pages) = guarded.then(|| guard(first * PAGE, last * PAGE)).flatten() {
         count = 0;
-        if !guarded {
-            return None;
-        }
-        guard(first * PAGE, last * PAGE)?
+        pages
     } else {
+        count = 0;
+        match by_page(j, first, last, guarded) {
+            Ok(pages) => by_pages = pages,
+            Err(pages) => {
+                // Pages asked about before one that cannot be: their writes
+                // are now cleared in the kernel, so the journal keeps them.
+                if !pages.is_empty() {
+                    j.asked += 1;
+                    for page in pages {
+                        j.written.insert(page, j.asked);
+                    }
+                }
+                return None;
+            }
+        }
         Vec::new()
     };
     #[cfg(feature = "diagnostics")]
@@ -110,7 +135,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+    let pages = j.found[..count]
+        .iter()
+        .map(|&at| at / PAGE)
+        .chain(guarded)
+        .chain(by_pages);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
@@ -121,6 +150,72 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
+}
+
+/// The written pages of pages `[first, last)`, asked about one at a time
+/// (clearing what the kernel reports): a write-watched page as the kernel
+/// says, a view's as its guard says, a reserved page with no memory as
+/// unwritten (noted as a hole, written once it holds memory). `Err` with
+/// the written pages found before a page none of these covers.
+fn by_page(
+    j: &mut Journal,
+    first: usize,
+    last: usize,
+    guarded: bool,
+) -> Result<Vec<usize>, Vec<usize>> {
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut written = Vec::new();
+    let mut answer = [0usize; PAGE / KERNEL_PAGE];
+    for page in first..last {
+        let mut count = answer.len();
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries.
+        let watched = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (page * PAGE) as *const _,
+                PAGE,
+                answer.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } == 0;
+        if watched {
+            if count > 0 || j.holes.remove(&page) {
+                written.push(page);
+            }
+            continue;
+        }
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return Err(written);
+        }
+        if info.State == MEM_RESERVE {
+            j.holes.insert(page);
+            continue;
+        }
+        let filled = j.holes.remove(&page);
+        if guarded
+            && info.Type == MEM_MAPPED
+            && let Some(pages) = guard(page * PAGE, (page + 1) * PAGE)
+        {
+            if filled || !pages.is_empty() {
+                written.push(page);
+            }
+            continue;
+        }
+        if filled {
+            written.push(page);
+        }
+        return Err(written);
+    }
+    Ok(written)
 }
 
 /// Guarded blocks of view memory.
@@ -249,6 +344,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    drop(g);
+    // New contents: written, for every refresh that copied the pages before
+    // (taken after the guards: `writes` takes the journal first).
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for page in at / PAGE..(at + len).div_ceil(PAGE) {
+        j.written.insert(page, now);
+        j.holes.remove(&page);
+    }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -326,16 +431,20 @@ pub(crate) mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // The journal outlives allocations: pages an earlier test wrote at
+        // this address may be listed, with older askings than this test's.
+        let (first, _) = writes(start, end, false).expect("watched");
+        let since = |pages: Vec<(usize, u64)>| -> Vec<(usize, u64)> {
+            pages.into_iter().filter(|&(_, w)| w > first).collect()
+        };
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        assert_eq!(since(after), [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
-        assert_eq!(again, [(p / PAGE + 1, now)]);
+        assert_eq!(since(again), [(p / PAGE + 1, now)]);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -465,9 +574,10 @@ pub(crate) mod tests {
         assert_eq!(shadow.update(start, watched), watched);
         assert_eq!(shadow.update(start, watched), 0);
 
-        // A small view in the next allocation needs the CPU fallback. A large
-        // conventional view on the same shadow can still use write watching.
-        assert_eq!(shadow.update(second.0 as usize, 4), 4);
+        // A small view in the next allocation is copied as its whole page
+        // (guarded there). A large conventional view on the same shadow can
+        // still use write watching.
+        assert_eq!(shadow.update(second.0 as usize, 4), PAGE);
         let refreshed: usize = (0..4).map(|_| shadow.update(start, watched)).sum();
         eprintln!(
             "4-byte unwatched refresh, then 4 clean watched requests copied {refreshed} bytes"
@@ -487,10 +597,181 @@ pub(crate) mod tests {
             assert_eq!(word, 500);
         }
 
-        // A later fallback crossing into the watched allocation invalidates
-        // that page's generation without affecting the remaining pages.
-        assert_eq!(shadow.update(start + watched - 4, 8), 8);
-        assert_eq!(shadow.update(start, watched), PAGE);
+        // A later small refresh across the allocations' border refetches at
+        // most the border page of the watched allocation, then nothing.
+        assert!(shadow.update(start + watched - 4, 8) >= 8);
+        assert!(shadow.update(start, watched) <= PAGE);
         assert_eq!(shadow.update(start, watched), 0);
+    }
+
+    /// Two adjacent allocations, the first write-watched, the second
+    /// write-watched if `watched`, each one page; kept reserved (the journal
+    /// remembers their pages).
+    fn neighbours(watched: bool) -> usize {
+        for _ in 0..16 {
+            // SAFETY: plain test reservations.
+            unsafe {
+                let span = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS);
+                assert!(!span.is_null());
+                assert_ne!(VirtualFree(span, 0, MEM_RELEASE), 0);
+                let kind = MEM_RESERVE | MEM_COMMIT;
+                let a = VirtualAlloc(span, PAGE, kind | MEM_WRITE_WATCH, PAGE_READWRITE);
+                if a.is_null() {
+                    continue;
+                }
+                let second = span.cast::<u8>().add(PAGE).cast();
+                let b = VirtualAlloc(second, PAGE, kind | if watched { MEM_WRITE_WATCH } else { 0 }, PAGE_READWRITE);
+                if b.is_null() {
+                    VirtualFree(a, 0, MEM_RELEASE);
+                    continue;
+                }
+                return span as usize;
+            }
+        }
+        panic!("no two adjacent allocations");
+    }
+
+    #[test]
+    fn a_range_over_watched_allocations_is_asked_page_by_page() {
+        let p = neighbours(true);
+        let (start, end) = (p, p + 2 * PAGE);
+        let (before, _) = writes(start, end, false).expect("watched, page by page");
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((p + 8) as *mut u8).write(1);
+            ((p + PAGE + 8) as *mut u8).write(1);
+        }
+        let (now, after) = writes(start, end, false).expect("watched, page by page");
+        let after: Vec<_> = after.into_iter().filter(|&(_, w)| w > before).collect();
+        assert_eq!(after, [(p / PAGE, now), (p / PAGE + 1, now)]);
+    }
+
+    #[test]
+    fn a_write_found_before_an_unwatched_page_is_kept() {
+        let p = neighbours(false);
+        let (before, _) = writes(p, p + PAGE, false).expect("watched");
+        // SAFETY: a committed page of ours.
+        unsafe { ((p + 8) as *mut u8).write(1) };
+        // The second allocation is not watched: refused, as before.
+        assert!(writes(p, p + 2 * PAGE, false).is_none());
+        // The first page's write was cleared in the kernel by that asking;
+        // the journal still has it.
+        let (_, again) = writes(p, p + PAGE, false).expect("watched");
+        assert!(again.iter().any(|&(page, w)| page == p / PAGE && w > before));
+    }
+
+    /// Adjacent one-page allocations of the given `VirtualAlloc` kinds
+    /// (read-write where committed); kept reserved.
+    fn pages_of(kinds: &[u32]) -> usize {
+        for _ in 0..16 {
+            // SAFETY: plain test reservations.
+            unsafe {
+                let n = kinds.len() * PAGE;
+                let span = VirtualAlloc(std::ptr::null(), n, MEM_RESERVE, PAGE_NOACCESS);
+                assert!(!span.is_null());
+                assert_ne!(VirtualFree(span, 0, MEM_RELEASE), 0);
+                let mut made = Vec::new();
+                for (i, &kind) in kinds.iter().enumerate() {
+                    let at = span.cast::<u8>().add(i * PAGE).cast();
+                    let protect = if kind & MEM_COMMIT != 0 { PAGE_READWRITE } else { PAGE_NOACCESS };
+                    let p = VirtualAlloc(at, PAGE, kind, protect);
+                    if p.is_null() {
+                        break;
+                    }
+                    made.push(p);
+                }
+                if made.len() == kinds.len() {
+                    return span as usize;
+                }
+                for p in made {
+                    VirtualFree(p, 0, MEM_RELEASE);
+                }
+            }
+        }
+        panic!("no adjacent allocations");
+    }
+
+    const WATCHED: u32 = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH;
+
+    #[test]
+    fn a_range_over_watched_pages_and_a_hole_is_tracked() {
+        let p = pages_of(&[WATCHED, MEM_RESERVE, WATCHED]);
+        let (start, end) = (p, p + 3 * PAGE);
+        let (before, _) = writes(start, end, false).expect("watched pages and a hole");
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((p + 8) as *mut u8).write(1);
+            ((p + 2 * PAGE + 8) as *mut u8).write(1);
+        }
+        let (now, after) = writes(start, end, false).expect("watched pages and a hole");
+        let after: Vec<_> = after.into_iter().filter(|&(_, w)| w > before).collect();
+        assert_eq!(after, [(p / PAGE, now), (p / PAGE + 2, now)]);
+    }
+
+    #[test]
+    fn a_remapped_page_is_written() {
+        let p = pages_of(&[WATCHED, MEM_RESERVE]);
+        let (before, _) = writes(p, p + 2 * PAGE, false).expect("tracked");
+        title_memory_remapped(p + PAGE, PAGE);
+        let (_, after) = writes(p, p + 2 * PAGE, false).expect("tracked");
+        assert!(after.iter().any(|&(page, w)| page == p / PAGE + 1 && w > before));
+    }
+
+    #[test]
+    fn a_hole_committed_later_is_not_taken_as_unchanged() {
+        let p = pages_of(&[WATCHED, MEM_RESERVE]);
+        assert!(writes(p, p + 2 * PAGE, false).is_some());
+        // Committed in place (not watched): no longer answerable.
+        // SAFETY: the reserved page of ours.
+        let at = unsafe { VirtualAlloc((p + PAGE) as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!at.is_null());
+        assert!(writes(p, p + 2 * PAGE, false).is_none());
+    }
+
+    #[test]
+    fn small_refreshes_of_watched_memory_copy_whole_pages_once() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let size = 4 * PAGE;
+        // SAFETY: a fresh write-watched allocation, kept reserved (below).
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                size,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: committed pages of ours. Touched first: reading a
+        // demand-zero page faults it in, which write watching reports.
+        unsafe { (base as *mut u8).write_bytes(0, size) };
+        crate::shadow::register(base, base as u64, size as u64);
+        let shadow = crate::shadow::find(base as u64, size as u64).unwrap();
+        // Small views (the world's directly indexed ones): eight in the
+        // first page, one in the third, none covering a page whole.
+        let views = [0, 64, 128, 1024, 4096, 8192, 16384, 32768, 2 * PAGE + 16];
+        let refresh = || -> usize { views.iter().map(|&at| shadow.update(base + at, 4)).sum() };
+        // First: the two pages, whole. They were "never copied" before, and
+        // a page only partly copied stayed so, copied again at every refresh.
+        assert_eq!(refresh(), 2 * PAGE);
+        assert_eq!(refresh(), 0);
+        assert_eq!(refresh(), 0);
+        // A title write brings back only its page, with the new bytes.
+        // SAFETY: a committed page of ours.
+        unsafe { ((base + 64) as *mut u32).write(500) };
+        assert_eq!(refresh(), PAGE);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the live shadow holds the refreshed word; no GPU work.
+        unsafe {
+            shadow.buffer.Map(0, None, Some(&mut data)).unwrap();
+            let word = data.cast::<u8>().add(64).cast::<u32>().read_unaligned();
+            shadow.buffer.Unmap(0, None);
+            assert_eq!(word, 500);
+        }
+        crate::shadow::unregister(base, base as u64);
+        // The allocation stays reserved: the write journal remembers its
+        // pages, and another test's allocation there would inherit them.
     }
 }

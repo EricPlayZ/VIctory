@@ -1294,9 +1294,12 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
             if !live(*key) || range.address == range.end {
                 continue;
             }
+            // Views whose pages touch join: the refresh is by whole pages
+            // anyway (`Shadow::update`), and each range costs a lock and a
+            // write-watch query (~1 million small views per world frame).
             if let Some((shadow, _, end)) = &mut pending
                 && Arc::ptr_eq(shadow, &range.shadow)
-                && range.address <= *end
+                && range.address / crate::watch::PAGE <= end.div_ceil(crate::watch::PAGE)
             {
                 *end = (*end).max(range.end);
                 continue;

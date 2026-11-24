@@ -280,6 +280,17 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        // Whole pages where the memory may be write-watched: a page counts as
+        // copied only when a refresh covers all of it, so small views (the
+        // world's directly indexed ones, most under a page) left their pages
+        // "never copied" and were copied again at every submission. Where
+        // watching fails only the requested bytes are copied.
+        let need = (from, to);
+        let (from, to) = if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            (from, to)
+        } else {
+            ((from / PAGE * PAGE).max(start), (to.div_ceil(PAGE) * PAGE).min(end))
+        };
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -296,21 +307,22 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, need);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, need);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, need)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
-    /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    /// shader writes; `need` is the range asked for, all that is copied
+    /// when the memory is not write-watched.
+    fn update_free(&self, from: usize, to: usize, need: (usize, usize)) -> usize {
         let watched = self.watched.load(Ordering::Relaxed);
         if watched != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
@@ -323,6 +335,10 @@ impl Shadow {
                     add(C::WatchBytes, copied as u64);
                 }
                 return copied;
+            }
+            let (from, to) = (from.max(need.0), to.min(need.1));
+            if from >= to {
+                return 0;
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::watch_failed(self as *const Self as usize, to - from);

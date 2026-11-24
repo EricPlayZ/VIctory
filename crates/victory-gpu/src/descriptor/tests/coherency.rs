@@ -487,7 +487,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     host.execute(&[&direct]);
     let direct_bytes = counter(C::DirectBytes) - before;
     assert_eq!(read(direct_result), 27);
-    assert_eq!(direct_bytes, 4);
+    // The view's page is copied whole (once): a page partly copied stays
+    // "never copied" and was copied again at every submission.
+    assert_eq!(direct_bytes, PAGE as u64);
 
     let before = counter(C::ConventionalBytes);
     let started = std::time::Instant::now();
